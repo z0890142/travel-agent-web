@@ -16,8 +16,25 @@ interface Message {
 // 1. 定義 API 的 URL，請根據您的後端位置修改
 const API_URL = "http://localhost:8000" // 假設您的 FastAPI 運行在 8000 port
 const md = new markdownit({
-    breaks: true // 將字串中的 '\n' 轉換為 <br>
+    breaks: true,      // 將字串中的 '\n' 轉換為 <br>
+    html: true,        // 允許 HTML 標籤
+    linkify: true,     // 自動轉換網址為連結
+    typographer: true, // 啟用排版功能
+    quotes: '“”‘’',    // 使用中文引號
+
   });
+
+function fixBrokenMarkdown(mdText: string): string {
+  return mdText
+    .replace(/(#+)([^\s#])/g, '$1 $2')              // 確保標題後有空格
+    .replace(/([^\n])(\n#+ )/g, '$1\n\n$2')         // 標題前補空行
+    .replace(/([^\n])(\n- )/g, '$1\n\n- ')          // 條目前補空行
+    .replace(/( - )/g, '\n- ')                      // 確保條目有獨立換行
+    .replace(/([^\n])(\n## )/g, '$1\n\n## ')        // 第二層區塊前補空行
+    .replace(/^(?!#|\s*$)(.+)$/gm, '\n$1')  // 每一行不是空行或標題，前面補一個空行
+    .replace(/\n{3,}/g, '\n\n')            // 避免重複空行過多
+    .trim();
+}
 
 export default function ChatPage() {
   const [messages, setMessages] = useState<Message[]>([])
@@ -67,23 +84,25 @@ export default function ChatPage() {
     }
   };
 
-  const fetchRecommendations = (currentSessionId: string) => {
+  const fetchFlightRecommendation = (currentSessionId: string) => {
     setIsLoading(true);
-    const recommendationMessageId = "llm-recommendation-stream-" + Date.now();
-    setMessages(prev => [...prev, { id: recommendationMessageId, role: "assistant", content: "" }]);
+    const recommendationMessageId = "llm-flight-recommendation-stream-" + Date.now();
+    setMessages(prev => [...prev, { id: recommendationMessageId, role: "assistant", content: "好的，我將開始建議航班資訊...\n\n" }]);
 
-    const source = new EventSource(`${API_URL}/api/v1/conversation/results/${currentSessionId}/recommendations`);
+    const source = new EventSource(`${API_URL}/api/v1/analyze/flight/${currentSessionId}/recommendations`);
     eventSourceRef.current = source;
 
+     const recommendationSSEMessageId = "llm-flight-recommendation-stream-" + Date.now();
     source.onmessage = (event) => {
+      console.log("Flight recommendation SSE:", event.data);
       if (event.data === "[DONE]") {
         source.close();
-        setIsLoading(false);
+        fetchHotelRecommendation(currentSessionId);
         return;
       }
       setMessages(prev =>
         prev.map(msg =>
-          msg.id === recommendationMessageId
+          msg.id === recommendationSSEMessageId
             ? { ...msg, content: msg.content + event.data }
             : msg
         )
@@ -92,7 +111,76 @@ export default function ChatPage() {
 
     source.onerror = (err) => {
       console.error("EventSource failed:", err);
-      setError(new Error("Failed to fetch recommendations. The connection was closed."));
+      setError(new Error("Failed to fetch flight recommendations. The connection was closed."));
+      source.close();
+      setIsLoading(false);
+    };
+  };
+
+  const fetchHotelRecommendation = (currentSessionId: string) => {
+    const recommendationMessageId = "llm-hotel-recommendation-stream-" + Date.now();
+    setMessages(prev => [...prev, { id: recommendationMessageId, role: "assistant", content: "接下來，我將開始建議住宿資訊...\n\n" }]);
+
+    const source = new EventSource(`${API_URL}/api/v1/analyze/hotel/${currentSessionId}/recommendations`);
+    eventSourceRef.current = source;
+
+    const recommendationSSEMessageId = "llm-hotel-recommendation-stream-" + Date.now();
+
+    source.onmessage = (event) => {
+      console.log("Hotel recommendation SSE:", event.data);
+      if (event.data === "[DONE]") {
+        source.close();
+        fetchOverallAnalysis(currentSessionId);
+        return;
+      }
+      setMessages(prev =>
+        prev.map(msg =>
+          msg.id === recommendationSSEMessageId
+            ? { ...msg, content: msg.content + event.data }
+            : msg
+        )
+      );
+    };
+
+    source.onerror = (err) => {
+      console.error("EventSource failed:", err);
+      setError(new Error("Failed to fetch hotel recommendations. The connection was closed."));
+      source.close();
+      setIsLoading(false);
+    };
+  };
+
+  const fetchOverallAnalysis = (currentSessionId: string) => {
+    const recommendationMessageId = "llm-overall-analysis-stream-" + Date.now();
+    setMessages(prev => [...prev, { id: recommendationMessageId, role: "assistant", content: "好的，這是我為您做的總結與建議...\n\n" }]);
+
+    const source = new EventSource(`${API_URL}/api/v1/analyze/travel/${currentSessionId}/recommendations`);
+    eventSourceRef.current = source;
+
+    const recommendationSSEMessageId = "llm-overall-analysis-stream-" + Date.now();
+
+    source.onmessage = (event) => {
+      console.log("Overall analysis SSE:", event.data);
+      if (event.data === "[DONE]") {
+        setMessages(prev => [...prev, { id: recommendationSSEMessageId, role: "assistant", content: "如果您需要詳細的住宿清單或航班清單，請跟我說 “住宿清單” 或 “航班清單”" }]);
+        source.close();
+        setIsLoading(false);
+        return;
+      }
+      setMessages(prev =>
+        prev.map(msg =>
+          msg.id === recommendationSSEMessageId
+            ? { ...msg, content: msg.content + event.data }
+            : msg
+        )
+      );
+    };
+
+    
+
+    source.onerror = (err) => {
+      console.error("EventSource failed:", err);
+      setError(new Error("Failed to fetch overall analysis. The connection was closed."));
       source.close();
       setIsLoading(false);
     };
@@ -151,6 +239,7 @@ export default function ChatPage() {
     setIsLoading(true);
     setError(null);
     try {
+      console.log("Checking status for session:", currentSessionId);
       const statusResponse = await fetch(`${API_URL}/api/v1/slot/${currentSessionId}`);
       if (!statusResponse.ok) throw new Error(`API Error (check status): ${statusResponse.status}`);
 
@@ -217,11 +306,11 @@ export default function ChatPage() {
         } else {
           hotelContent += "暫無住宿資訊\n";
         }
-        
+
         setMessages(prev => [...prev, { id: 'flight-info-' + Date.now(), role: 'assistant', content: flightContent }]);
         setMessages(prev => [...prev, { id: 'hotel-info-' + Date.now(), role: 'assistant', content: hotelContent }]);
-
-        // fetchRecommendations(currentSessionId);
+        
+        fetchFlightRecommendation(currentSessionId);
       } else { // 'incomplete' or 'in_progress'
         await fetchSlot(currentSessionId);
       }
@@ -247,9 +336,9 @@ export default function ChatPage() {
 
         const data = await response.json();
         if (!data.session_id) throw new Error("No session ID returned from server.");
-        
+
         setSessionId(data.session_id);
-        await checkStatusAndFetchNext(data.session_id); 
+        await checkStatusAndFetchNext(data.session_id);
       } catch (err) {
         setError(err instanceof Error ? err : new Error("Failed to start a new session."));
         setIsLoading(false);
@@ -344,7 +433,9 @@ export default function ChatPage() {
                       >
                          <div
                           className="prose text-sm text-inherit"
-                          dangerouslySetInnerHTML={{ __html: md.render(message.content.replace(/\\n/g, "\n")) }}
+                          dangerouslySetInnerHTML={{
+                            __html: md.render(fixBrokenMarkdown(message.content))
+                          }}
                         />
                       </div>
 
